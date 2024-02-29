@@ -3,13 +3,13 @@ import os
 import re
 import time
 import sys
-import firecloud.api as fapi
 import subprocess
 import threading
 import json
-
-TERRA_POLL_SPACER = 300
-TERRA_TIMEOUT = 18000
+from string import Template
+import firecloud.api as fapi
+import pandas as pd
+from consts import TERRA_POLL_SPACER, TERRA_TIMEOUT
 
 alto_lock = threading.Lock()
 
@@ -22,7 +22,8 @@ def build_directories(basedir):
         'results': basedir + "/cumulus",
         'cellranger_arc': basedir + "/cellranger_arc",
         'cellbender': basedir + "/cellbenderV2",
-        'cellbender_results': basedir + "/cellbenderV2_cumulus"
+        'cellbender_results': basedir + "/cellbenderV2_cumulus",
+        'bcl_convert': basedir + "/bcl_convert" 
     }
     for directory in directories.values():
         if not os.path.exists(directory):
@@ -37,7 +38,8 @@ def build_buckets(gcp_basedir, project):
         'results': gcp_basedir + "/cumulus_" + project,
         'cellranger_arc': gcp_basedir + "/cellranger_arc_" + project,
         'cellbender': gcp_basedir + "/cellbenderv2_" + project,
-        'cellbender_results': gcp_basedir + "/cellbenderv2_cumulus_" + project
+        'cellbender_results': gcp_basedir + "/cellbenderv2_cumulus_" + project,
+        'bcl_convert': gcp_basedir + "/bcl_convert_" + project
     }
 
 
@@ -58,7 +60,7 @@ def build_sample_dicts(sample_tracking, sampleids):
     cumulus_dict = dict()
     cellbender_dict = dict()
     cellranger_dict = dict()
-    for index, row in sample_tracking.iterrows():
+    for _, row in sample_tracking.iterrows():
         sample_dict[row['sampleid']].append(row['Sample'])
         mkfastq_dict[row['Sample']] = [row['Lane'], row['Index'], row['reference'], row['chemistry'], row['method']]
         cumulus_dict[row['sampleid']] = [row['min_umis'], row['min_genes'], row['percent_mito']]
@@ -139,3 +141,133 @@ def log_workflow_details(response):
             logging.info(line)
     except:
         logging.info('Unable to gather workflow input.')
+
+def create_bcl_convert_sample_sheet(path, sub_method, env_vars, sample_tracking):
+    if sub_method == 'atac':
+        sample_sheet = get_atac_sample_sheet(env_vars, sample_tracking, env_vars['num_lanes'])
+    elif sub_method == 'rna':
+        sample_sheet = get_rna_sample_sheet(env_vars, sample_tracking, env_vars['num_lanes'])
+
+    with open(path, 'w') as f:
+        f.write(sample_sheet)
+
+def get_rna_sample_sheet(env_vars, sample_tracking, num_lanes):
+    file_dir = os.path.dirname(os.path.realpath(__file__))
+    with open(f'{file_dir}/templates/bcl_convert_gex_sample_sheet_template.csv') as f:
+        template = Template(f.read())
+        sample_sheet = template.safe_substitute(env_vars)
+
+    columns = ["sampleid", "Index", "Index2"]
+    columns = columns + ["Lane"] if not env_vars.get("no_lane_splitting") else columns
+    samples_with_indices = sample_tracking[columns]
+
+    if not env_vars.get("no_lane_splitting"):
+        samples_with_indices = apply_lane_splits(samples_with_indices, num_lanes)
+
+    samples_with_indices = samples_with_indices.rename(columns={"sampleid": "Sample_ID", "Index": "index", "Index2": "index2"})
+    return sample_sheet + samples_with_indices.to_csv(index=False,)
+
+def get_atac_sample_sheet(env_vars, sample_tracking, num_lanes):
+    file_dir = os.path.dirname(os.path.realpath(__file__))
+    with open(f'{file_dir}/templates/bcl_convert_atac_sample_sheet_template.csv') as f:
+        template = Template(f.read())
+        sample_sheet = template.safe_substitute(env_vars)
+
+    columns = ["Lane", "sampleid", "Index", "Index2", "Index3", "Index4"]
+    samples_with_indices = sample_tracking.get(columns)
+    flattend_sample_indices = flatten_sample_indices(samples_with_indices)
+
+    if env_vars.get("no_lane_splitting"): 
+        flattend_sample_indices.drop(columns='Lane', inplace=True)
+    else:
+        flattend_sample_indices = apply_lane_splits(flattend_sample_indices, num_lanes)
+
+    return sample_sheet + flattend_sample_indices.to_csv(index=False)
+
+def flatten_sample_indices(sample_tracking):
+    flattened = pd.DataFrame(columns=["Lane", "Sample_ID", "index"])
+    for _, r in sample_tracking.iterrows():
+        sample_id = r['sampleid']
+        sample_df = pd.DataFrame([
+            [r['Lane'], sample_id, r['Index']],
+            [r['Lane'], sample_id, r['Index2']],
+            [r['Lane'], sample_id, r['Index3']],
+            [r['Lane'], sample_id, r['Index4']],
+        ], columns=["Lane", "Sample_ID", "index"])
+        flattened = pd.concat([flattened, sample_df], ignore_index=True)
+    return flattened
+
+def apply_lane_splits(sample_tracking, num_lanes):
+    lane_split = []
+
+    for _, sample in sample_tracking.iterrows():
+        lane_val = str(sample['Lane'])
+        drop_lane = sample.drop(labels=['Lane'])
+        if len(lane_val) == 1 and lane_val.isdecimal(): # no need to split
+            lane_split.append([sample['Lane']] + drop_lane.to_list())
+        elif '-' in lane_val:
+            start, end = lane_val.split('-')
+            r = range(int(start), int(end)+1)
+            for i in r:
+                lane_split.append([i] + drop_lane.to_list())
+        elif lane_val == '*':
+            for i in range(num_lanes):
+                lane_split.append([i+1] + drop_lane.to_list())
+
+    return pd.DataFrame(lane_split, columns=['Lane'] + sample_tracking.columns.drop('Lane').to_list())
+
+def create_bcl_convert_params(file_path, env_vars, input_dir, fastq_output_dir, sample_sheet_path):
+    with open(file_path, "w") as f: 
+        params = {
+                "bclconvert.bcl_convert_version": f"{env_vars['software_version']}",
+                "bclconvert.delete_input_bcl_directory": env_vars['delete_input_dir'],
+                "bclconvert.disk_space": env_vars['disk_space'],
+                "bclconvert.docker_registry": env_vars['docker_registry'],
+                "bclconvert.input_bcl_directory": input_dir,
+                "bclconvert.memory": f"{env_vars['memory']}G",
+                "bclconvert.no_lane_splitting": env_vars["no_lane_splitting"],
+                "bclconvert.num_cpu": env_vars['cpu'],
+                "bclconvert.output_directory": fastq_output_dir,
+                # "bclconvert.run_bcl_convert.run_id": "${}",
+                "bclconvert.sample_sheet": sample_sheet_path,
+                "bclconvert.strict_mode": env_vars['strict_mode']
+                # "bclconvert.zones": "${}"
+            }
+
+        contents = json.dumps(params, indent=4)
+        f.write(contents)
+
+def get_bcl_convert_vars(env_vars, sample_sheet, flow_cell):
+    bcl_convert_vars = env_vars.copy()
+    bcl_convert_vars['run_name'] = flow_cell
+    bcl_convert_vars['instrument_platform'] = sample_sheet['instrument_platform'][0]
+    bcl_convert_vars['instrument_type'] = sample_sheet['instrument_type'][0]
+    bcl_convert_vars['read1_cycles'] = int(sample_sheet['read1_cycles'][0])
+    bcl_convert_vars['read2_cycles'] = int(sample_sheet['read2_cycles'][0])
+    bcl_convert_vars['index1_cycles'] = int(sample_sheet['index1_cycles'][0])
+    bcl_convert_vars['index2_cycles'] = int(sample_sheet['index2_cycles'][0])
+    bcl_convert_vars['create_fastq_for_index_reads'] = get_boolean_val(sample_sheet['create_fastq_for_index_reads'][0])
+    bcl_convert_vars['trim_umi'] = get_boolean_val(sample_sheet['trim_umi'][0])
+    bcl_convert_vars['override_cycles'] = sample_sheet['override_cycles'][0]
+    return bcl_convert_vars
+
+def add_lane_to_fastq(file_name):
+    if not re.match("^.*L\d{3}.*$", file_name):
+        split = re.split("(S\d+)", file_name)
+        return ''.join(split[:2]) + '_L001' + split[2]
+    return file_name
+
+def get_boolean_val(val):
+    match str(val).lower():
+        case '1.0' | '1':
+            return 1
+        case '0.0' | '0':
+            return 0 
+        case 'true':
+            return 'true'
+        case 'false':
+            return 'false'
+        case '' | 'nan':
+            return ''
+        case _:
+            raise ValueError

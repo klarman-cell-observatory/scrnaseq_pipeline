@@ -8,7 +8,7 @@ The sample tracking file, in csv format, is a useful way to track the important 
 - date: The date your samples are processed in yyyy_mm_dd format.
 - run_pipeline: Boolean (True or False) that determines what samples are processed. Set this to True for all samples you want to processs. All other samples must be set to False. How this works in operation is that as you add your new samples, set them to run_pipeline = True and set the previously run samples to run_pipeline = False. Remember that all samples that are processed together must come from the same flow cell. The code is written to only process one flow cell!
 - method: [rna, atac, or multiome] toggles the use of cellranger, cellranger atac and cellranger arc
-- submethod: [rna, atac] if method == rna always set submethod to rna, if method == atac always set submethod to atac. Fot method == multiome, the submethod deliniates the rna and atac portions of the multiome.
+- submethod: [rna, atac] if method == rna always set submethod to rna, if method == atac always set submethod to atac. Fot method == multiome, the submethod delineates the rna and atac portions of the multiome.
 - Channel Name: This is the sample name that is used by the experimental team to name a 10x channel.
 - sampleid: This is the sample id.
 - condition: Any biological or technical condition used in collecting this sample. This could be a buffer used or a flow cytometry sorting gate. If there is no special condition, label this as none.
